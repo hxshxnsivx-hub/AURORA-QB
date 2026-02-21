@@ -1,0 +1,51 @@
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build outputs
+.next/
+out/
+build/
+dist/
+
+# Database
+*.db
+*.sqlite3
+postgres_data/
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes
+minio_data/
+redis_data/
+
+# Testing
+.coverage
+.pytest_cache/
+.hypothesis/
+htmlcov/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
