@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 from string import Template
 from enum import Enum
 
-from backend.utils.logger import get_logger
+from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -311,3 +311,46 @@ Respond in JSON format:
 
 # Global prompt registry instance
 prompt_registry = PromptRegistry()
+
+
+# Direct prompt templates for question extraction
+QUESTION_BOUNDARY_PROMPT = """The following text contains multiple exam questions. Extract each question as a separate item.
+
+Text:
+{text}
+
+For each question, identify:
+1. The complete question text
+2. Marks indicated (if present)
+
+Respond in JSON format:
+{{
+  "questions": [
+    {{
+      "text": "<complete question text>",
+      "marks": <number or null>
+    }},
+    ...
+  ]
+}}"""
+
+
+TAG_SUGGESTION_PROMPT = """You are analyzing an exam question to extract metadata.
+
+Question: {question_text}
+
+Extract the following information:
+1. Marks: Estimated marks for this question (1, 2, 3, 5, 10, or 12)
+2. Type: MCQ, Short Answer, Long Answer, Numerical, or True/False
+3. Difficulty: Easy, Medium, or Hard
+4. Topic: Main topic covered (be specific)
+5. Unit: Broader unit or chapter
+
+Respond in JSON format:
+{{
+  "marks": <number>,
+  "type": "<type>",
+  "difficulty": "<difficulty>",
+  "topic": "<topic>",
+  "unit": "<unit>"
+}}"""

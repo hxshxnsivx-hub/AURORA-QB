@@ -9,7 +9,7 @@ import re
 from typing import Any, Dict, Optional, Type
 from pydantic import BaseModel, ValidationError
 
-from backend.utils.logger import get_logger
+from utils.logger import get_logger
 
 logger = get_logger(__name__)
 

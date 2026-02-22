@@ -18,9 +18,9 @@ import anthropic
 from anthropic import AsyncAnthropic
 import tiktoken
 
-from backend.config import settings
-from backend.utils.logger import get_logger
-from backend.llm.rate_limiter import RateLimiter
+from config import settings
+from utils.logger import get_logger
+from llm.rate_limiter import RateLimiter
 
 logger = get_logger(__name__)
 
