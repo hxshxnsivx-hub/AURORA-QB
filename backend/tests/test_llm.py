@@ -8,12 +8,17 @@ import pytest
 import asyncio
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
 import json
+import sys
+import os
 
-from backend.llm.client import LLMClient, LLMConfig, LLMProvider, LLMResponse
-from backend.llm.prompts import PromptTemplate, PromptRegistry, PromptType
-from backend.llm.parser import ResponseParser
-from backend.llm.embeddings import EmbeddingGenerator
-from backend.llm.rate_limiter import RateLimiter
+# Add backend to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from llm.client import LLMClient, LLMConfig, LLMProvider, LLMResponse
+from llm.prompts import PromptTemplate, PromptRegistry, PromptType
+from llm.parser import ResponseParser
+from llm.embeddings import EmbeddingGenerator
+from llm.rate_limiter import RateLimiter
 
 
 class TestPromptTemplate:
