@@ -1,54 +1,189 @@
 """
 Retry logic with exponential backoff for agent tasks.
 
-Implements:
-- Configurable retry attempts
-- Exponential backoff calculation
-- Max retry limits
-- Jitter to prevent thundering herd
+This module provides retry decorators and utilities for handling
+transient failures in agent processing and external API calls.
 """
 
 import asyncio
+import functools
+from typing import Callable, Optional, Tuple, Type
+from datetime import datetime
 import random
-from typing import Optional, Callable, Any
-from datetime import datetime, timedelta
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.agent import AgentTask, AgentTaskStatus
-from agents.task_queue import AgentTaskManager, TaskQueue
 from utils.logger import logger
 
 
-class RetryConfig:
-    """Configuration for retry behavior"""
+def calculate_backoff(
+    attempt: int,
+    base_delay: float = 1.0,
+    max_delay: float = 60.0,
+    exponential_base: float = 2.0,
+    jitter: bool = True
+) -> float:
+    """
+    Calculate exponential backoff delay.
+    
+    Args:
+        attempt: Current attempt number (0-indexed)
+        base_delay: Base delay in seconds
+        max_delay: Maximum delay in seconds
+        exponential_base: Base for exponential calculation
+        jitter: Whether to add random jitter
+    
+    Returns:
+        Delay in seconds
+    """
+    # Calculate exponential delay
+    delay = min(base_delay * (exponential_base ** attempt), max_delay)
+    
+    # Add jitter to prevent thundering herd
+    if jitter:
+        delay = delay * (0.5 + random.random() * 0.5)
+    
+    return delay
+
+
+def retry_with_backoff(
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 60.0,
+    exponential_base: float = 2.0,
+    exceptions: Tuple[Type[Exception], ...] = (Exception,),
+    on_retry: Optional[Callable] = None
+):
+    """
+    Decorator for retrying async functions with exponential backoff.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        base_delay: Base delay in seconds
+        max_delay: Maximum delay in seconds
+        exponential_base: Base for exponential calculation
+        exceptions: Tuple of exception types to catch and retry
+        on_retry: Optional callback function called on each retry
+    
+    Example:
+        @retry_with_backoff(max_retries=3, base_delay=1.0)
+        async def fetch_data():
+            # Code that might fail
+            pass
+    """
+    def decorator(func: Callable):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exception = None
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    return await func(*args, **kwargs)
+                    
+                except exceptions as e:
+                    last_exception = e
+                    
+                    if attempt < max_retries:
+                        delay = calculate_backoff(
+                            attempt,
+                            base_delay=base_delay,
+                            max_delay=max_delay,
+                            exponential_base=exponential_base
+                        )
+                        
+                        logger.warning(
+                            f"Retry attempt {attempt + 1}/{max_retries} for {func.__name__}",
+                            extra={
+                                "function": func.__name__,
+                                "attempt": attempt + 1,
+                                "max_retries": max_retries,
+                                "delay": delay,
+                                "error": str(e)
+                            }
+                        )
+                        
+                        # Call retry callback if provided
+                        if on_retry:
+                            try:
+                                if asyncio.iscoroutinefunction(on_retry):
+                                    await on_retry(attempt, e, delay)
+                                else:
+                                    on_retry(attempt, e, delay)
+                            except Exception as callback_error:
+                                logger.error("Retry callback error", extra={
+                                    "error": str(callback_error)
+                                })
+                        
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(
+                            f"Max retries exceeded for {func.__name__}",
+                            extra={
+                                "function": func.__name__,
+                                "max_retries": max_retries,
+                                "error": str(e)
+                            }
+                        )
+            
+            # All retries exhausted, raise the last exception
+            raise last_exception
+        
+        return wrapper
+    return decorator
+
+
+class RetryPolicy:
+    """
+    Retry policy configuration for agent tasks.
+    
+    This class encapsulates retry behavior and can be customized
+    per agent or task type.
+    """
     
     def __init__(
         self,
-        max_attempts: int = 3,
-        initial_delay: float = 1.0,
-        max_delay: float = 300.0,
+        max_retries: int = 3,
+        base_delay: float = 1.0,
+        max_delay: float = 60.0,
         exponential_base: float = 2.0,
-        jitter: bool = True
+        jitter: bool = True,
+        retry_on: Tuple[Type[Exception], ...] = (Exception,)
     ):
         """
-        Initialize retry configuration
+        Initialize retry policy.
         
         Args:
-            max_attempts: Maximum number of retry attempts
-            initial_delay: Initial delay in seconds
+            max_retries: Maximum number of retry attempts
+            base_delay: Base delay in seconds
             max_delay: Maximum delay in seconds
-            exponential_base: Base for exponential backoff (2.0 = double each time)
-            jitter: Add random jitter to prevent thundering herd
+            exponential_base: Base for exponential calculation
+            jitter: Whether to add random jitter
+            retry_on: Tuple of exception types to retry on
         """
-        self.max_attempts = max_attempts
-        self.initial_delay = initial_delay
+        self.max_retries = max_retries
+        self.base_delay = base_delay
         self.max_delay = max_delay
         self.exponential_base = exponential_base
         self.jitter = jitter
+        self.retry_on = retry_on
     
-    def calculate_delay(self, attempt: int) -> float:
+    def should_retry(self, exception: Exception, attempt: int) -> bool:
         """
-        Calculate delay for retry attempt using exponential backoff
+        Determine if an exception should trigger a retry.
+        
+        Args:
+            exception: The exception that occurred
+            attempt: Current attempt number (0-indexed)
+        
+        Returns:
+            True if should retry, False otherwise
+        """
+        if attempt >= self.max_retries:
+            return False
+        
+        return isinstance(exception, self.retry_on)
+    
+    def get_delay(self, attempt: int) -> float:
+        """
+        Get delay for a specific attempt.
         
         Args:
             attempt: Current attempt number (0-indexed)
@@ -56,313 +191,140 @@ class RetryConfig:
         Returns:
             Delay in seconds
         """
-        # Calculate exponential delay
-        delay = self.initial_delay * (self.exponential_base ** attempt)
-        
-        # Cap at max delay
-        delay = min(delay, self.max_delay)
-        
-        # Add jitter (random 0-25% of delay)
-        if self.jitter:
-            jitter_amount = delay * 0.25 * random.random()
-            delay += jitter_amount
-        
-        return delay
+        return calculate_backoff(
+            attempt,
+            base_delay=self.base_delay,
+            max_delay=self.max_delay,
+            exponential_base=self.exponential_base,
+            jitter=self.jitter
+        )
     
-    def should_retry(self, attempt: int) -> bool:
-        """
-        Check if task should be retried
-        
-        Args:
-            attempt: Current attempt number (0-indexed)
-        
-        Returns:
-            True if should retry
-        """
-        return attempt < self.max_attempts
-
-
-class RetryManager:
-    """Manages task retry logic"""
-    
-    # Default retry configuration
-    DEFAULT_CONFIG = RetryConfig(
-        max_attempts=3,
-        initial_delay=1.0,
-        max_delay=300.0,
-        exponential_base=2.0,
-        jitter=True
-    )
-    
-    @staticmethod
-    async def retry_task(
-        db: AsyncSession,
-        task_id: int,
-        config: Optional[RetryConfig] = None
-    ) -> bool:
-        """
-        Retry a failed task with exponential backoff
-        
-        Args:
-            db: Database session
-            task_id: Task ID to retry
-            config: Retry configuration (uses default if None)
-        
-        Returns:
-            True if retry scheduled
-        """
-        if config is None:
-            config = RetryManager.DEFAULT_CONFIG
-        
-        try:
-            # Get task
-            task = await AgentTaskManager.get_task(db, task_id)
-            
-            if not task:
-                logger.error(
-                    "Task not found for retry",
-                    extra={"task_id": task_id}
-                )
-                return False
-            
-            # Check if should retry
-            if not config.should_retry(task.retry_count):
-                logger.warning(
-                    "Task exceeded max retry attempts",
-                    extra={
-                        "task_id": task_id,
-                        "retry_count": task.retry_count,
-                        "max_attempts": config.max_attempts
-                    }
-                )
-                return False
-            
-            # Calculate delay
-            delay = config.calculate_delay(task.retry_count)
-            
-            logger.info(
-                "Scheduling task retry",
-                extra={
-                    "task_id": task_id,
-                    "retry_count": task.retry_count + 1,
-                    "delay_seconds": delay
-                }
-            )
-            
-            # Schedule retry after delay
-            asyncio.create_task(
-                RetryManager._delayed_retry(db, task_id, delay)
-            )
-            
-            return True
-            
-        except Exception as e:
-            logger.error(
-                "Failed to schedule retry",
-                extra={
-                    "task_id": task_id,
-                    "error": str(e)
-                }
-            )
-            return False
-    
-    @staticmethod
-    async def _delayed_retry(
-        db: AsyncSession,
-        task_id: int,
-        delay: float
-    ):
-        """
-        Execute delayed retry
-        
-        Args:
-            db: Database session
-            task_id: Task ID
-            delay: Delay in seconds
-        """
-        try:
-            # Wait for delay
-            await asyncio.sleep(delay)
-            
-            # Retry task
-            success = await AgentTaskManager.retry_task(db, task_id)
-            
-            if success:
-                logger.info(
-                    "Task retry executed",
-                    extra={"task_id": task_id}
-                )
-            else:
-                logger.error(
-                    "Task retry failed",
-                    extra={"task_id": task_id}
-                )
-                
-        except Exception as e:
-            logger.error(
-                "Delayed retry error",
-                extra={
-                    "task_id": task_id,
-                    "error": str(e)
-                }
-            )
-    
-    @staticmethod
-    async def retry_with_backoff(
+    async def execute_with_retry(
+        self,
         func: Callable,
         *args,
-        config: Optional[RetryConfig] = None,
         **kwargs
-    ) -> Any:
+    ):
         """
-        Retry a function with exponential backoff
+        Execute a function with retry logic.
         
         Args:
-            func: Async function to retry
-            *args: Function arguments
-            config: Retry configuration
-            **kwargs: Function keyword arguments
+            func: Async function to execute
+            *args: Positional arguments for func
+            **kwargs: Keyword arguments for func
         
         Returns:
-            Function result
+            Result of func
         
         Raises:
-            Exception: If all retries fail
+            Last exception if all retries exhausted
         """
-        if config is None:
-            config = RetryManager.DEFAULT_CONFIG
-        
         last_exception = None
         
-        for attempt in range(config.max_attempts):
+        for attempt in range(self.max_retries + 1):
             try:
-                # Try to execute function
-                if asyncio.iscoroutinefunction(func):
-                    result = await func(*args, **kwargs)
-                else:
-                    result = func(*args, **kwargs)
-                
-                # Success
-                if attempt > 0:
-                    logger.info(
-                        "Function succeeded after retry",
-                        extra={
-                            "function": func.__name__,
-                            "attempt": attempt + 1
-                        }
-                    )
-                
-                return result
+                return await func(*args, **kwargs)
                 
             except Exception as e:
+                if not self.should_retry(e, attempt):
+                    raise
+                
                 last_exception = e
                 
-                logger.warning(
-                    "Function failed, will retry",
-                    extra={
+                if attempt < self.max_retries:
+                    delay = self.get_delay(attempt)
+                    
+                    logger.warning("Retrying with policy", extra={
                         "function": func.__name__,
                         "attempt": attempt + 1,
-                        "max_attempts": config.max_attempts,
+                        "max_retries": self.max_retries,
+                        "delay": delay,
                         "error": str(e)
-                    }
-                )
-                
-                # Check if should retry
-                if not config.should_retry(attempt):
-                    break
-                
-                # Calculate and wait for delay
-                delay = config.calculate_delay(attempt)
-                await asyncio.sleep(delay)
-        
-        # All retries failed
-        logger.error(
-            "Function failed after all retries",
-            extra={
-                "function": func.__name__,
-                "attempts": config.max_attempts,
-                "error": str(last_exception)
-            }
-        )
+                    })
+                    
+                    await asyncio.sleep(delay)
         
         raise last_exception
-    
-    @staticmethod
-    async def retry_failed_tasks(
-        db: AsyncSession,
-        since: Optional[datetime] = None,
-        config: Optional[RetryConfig] = None
-    ) -> int:
-        """
-        Retry all failed tasks
-        
-        Args:
-            db: Database session
-            since: Only retry tasks failed after this time
-            config: Retry configuration
-        
-        Returns:
-            Number of tasks scheduled for retry
-        """
-        if config is None:
-            config = RetryManager.DEFAULT_CONFIG
-        
-        try:
-            # Get failed tasks
-            failed_tasks = await AgentTaskManager.get_failed_tasks(
-                db,
-                since=since,
-                limit=100
-            )
-            
-            retry_count = 0
-            
-            for task in failed_tasks:
-                # Check if should retry
-                if config.should_retry(task.retry_count):
-                    success = await RetryManager.retry_task(db, task.id, config)
-                    if success:
-                        retry_count += 1
-            
-            logger.info(
-                "Batch retry completed",
-                extra={
-                    "total_failed": len(failed_tasks),
-                    "retried": retry_count
-                }
-            )
-            
-            return retry_count
-            
-        except Exception as e:
-            logger.error(
-                "Batch retry failed",
-                extra={"error": str(e)}
-            )
-            return 0
 
 
-# Decorator for automatic retry
-def with_retry(config: Optional[RetryConfig] = None):
-    """
-    Decorator to add retry logic to async functions
+# Default retry policies for different scenarios
+
+# Fast retry for quick operations
+FAST_RETRY = RetryPolicy(
+    max_retries=3,
+    base_delay=0.5,
+    max_delay=5.0,
+    exponential_base=2.0
+)
+
+# Standard retry for most operations
+STANDARD_RETRY = RetryPolicy(
+    max_retries=3,
+    base_delay=1.0,
+    max_delay=30.0,
+    exponential_base=2.0
+)
+
+# Slow retry for expensive operations
+SLOW_RETRY = RetryPolicy(
+    max_retries=5,
+    base_delay=2.0,
+    max_delay=120.0,
+    exponential_base=2.0
+)
+
+# LLM API retry (handles rate limits)
+LLM_RETRY = RetryPolicy(
+    max_retries=5,
+    base_delay=1.0,
+    max_delay=60.0,
+    exponential_base=2.0
+)
+
+
+class RetryStats:
+    """Track retry statistics for monitoring"""
     
-    Args:
-        config: Retry configuration
+    def __init__(self):
+        self.total_attempts = 0
+        self.successful_retries = 0
+        self.failed_retries = 0
+        self.total_delay = 0.0
     
-    Example:
-        @with_retry(RetryConfig(max_attempts=5))
-        async def my_function():
-            # Function code
-            pass
-    """
-    def decorator(func: Callable):
-        async def wrapper(*args, **kwargs):
-            return await RetryManager.retry_with_backoff(
-                func,
-                *args,
-                config=config,
-                **kwargs
+    def record_attempt(self, success: bool, delay: float = 0.0):
+        """Record a retry attempt"""
+        self.total_attempts += 1
+        if success:
+            self.successful_retries += 1
+        else:
+            self.failed_retries += 1
+        self.total_delay += delay
+    
+    def get_stats(self) -> dict:
+        """Get retry statistics"""
+        return {
+            "total_attempts": self.total_attempts,
+            "successful_retries": self.successful_retries,
+            "failed_retries": self.failed_retries,
+            "success_rate": (
+                self.successful_retries / self.total_attempts
+                if self.total_attempts > 0
+                else 0.0
+            ),
+            "average_delay": (
+                self.total_delay / self.total_attempts
+                if self.total_attempts > 0
+                else 0.0
             )
-        return wrapper
-    return decorator
+        }
+    
+    def reset(self):
+        """Reset statistics"""
+        self.total_attempts = 0
+        self.successful_retries = 0
+        self.failed_retries = 0
+        self.total_delay = 0.0
+
+
+# Global retry stats
+retry_stats = RetryStats()

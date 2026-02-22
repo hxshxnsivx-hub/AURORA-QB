@@ -1,316 +1,237 @@
 """
-Event system for agent coordination.
+Event publishing and subscription system for agent communication.
 
-Provides pub/sub event handling for:
-- Task lifecycle events
-- Agent status events
-- System events
-- Custom events
+This module provides a pub/sub event bus using Redis for inter-agent
+communication and system-wide event notifications.
 """
 
+from typing import Dict, Any, Callable, List
 import asyncio
-from typing import Dict, Callable, List, Any, Optional
+import json
 from datetime import datetime
-from enum import Enum
 
 from utils.redis_client import redis_client
 from utils.logger import logger
 
 
-class EventType(str, Enum):
-    """Standard event types"""
-    
-    # Task events
-    TASK_CREATED = "task_created"
-    TASK_STARTED = "task_started"
-    TASK_COMPLETED = "task_completed"
-    TASK_FAILED = "task_failed"
-    TASK_RETRIED = "task_retried"
-    
-    # Agent events
-    AGENT_STARTED = "agent_started"
-    AGENT_STOPPED = "agent_stopped"
-    AGENT_ERROR = "agent_error"
-    
-    # System events
-    ORCHESTRATOR_STARTED = "orchestrator_started"
-    ORCHESTRATOR_STOPPED = "orchestrator_stopped"
-    QUEUE_FULL = "queue_full"
-    QUEUE_EMPTY = "queue_empty"
-    
-    # Custom events
-    CUSTOM = "custom"
-
-
 class EventBus:
     """
-    Event bus for pub/sub messaging
+    Event bus for publishing and subscribing to system events.
     
-    Allows components to publish and subscribe to events
-    without direct coupling.
+    Events are published to Redis channels and can be subscribed to
+    by multiple consumers for real-time notifications.
     """
     
     def __init__(self):
-        """Initialize event bus"""
-        self.handlers: Dict[str, List[Callable]] = {}
-        self.running = False
-        self._listener_task: Optional[asyncio.Task] = None
-    
-    def subscribe(self, event_type: EventType, handler: Callable):
-        """
-        Subscribe to event type
-        
-        Args:
-            event_type: Type of event to subscribe to
-            handler: Async function to call when event occurs
-        """
-        channel = f"agent:events:{event_type.value}"
-        
-        if channel not in self.handlers:
-            self.handlers[channel] = []
-        
-        self.handlers[channel].append(handler)
-        
-        logger.info(
-            "Event handler subscribed",
-            extra={
-                "event_type": event_type.value,
-                "handler": handler.__name__,
-                "total_handlers": len(self.handlers[channel])
-            }
-        )
-    
-    def unsubscribe(self, event_type: EventType, handler: Callable):
-        """
-        Unsubscribe from event type
-        
-        Args:
-            event_type: Type of event
-            handler: Handler function to remove
-        """
-        channel = f"agent:events:{event_type.value}"
-        
-        if channel in self.handlers and handler in self.handlers[channel]:
-            self.handlers[channel].remove(handler)
-            
-            logger.info(
-                "Event handler unsubscribed",
-                extra={
-                    "event_type": event_type.value,
-                    "handler": handler.__name__
-                }
-            )
+        self.redis = redis_client
+        self.subscribers: Dict[str, List[Callable]] = {}
+        self.pubsub = None
+        self.listener_task: asyncio.Task = None
     
     async def publish(
         self,
-        event_type: EventType,
+        event_type: str,
         data: Dict[str, Any],
-        metadata: Optional[Dict[str, Any]] = None
-    ):
+        metadata: Dict[str, Any] = None
+    ) -> int:
         """
-        Publish event
+        Publish an event to a channel.
         
         Args:
-            event_type: Type of event
+            event_type: Event type/channel name
             data: Event data
             metadata: Optional metadata
-        """
-        channel = f"agent:events:{event_type.value}"
         
+        Returns:
+            Number of subscribers that received the message
+        """
         event = {
-            "type": event_type.value,
+            "event_type": event_type,
             "data": data,
             "metadata": metadata or {},
             "timestamp": datetime.utcnow().isoformat()
         }
         
-        try:
-            await redis_client.publish(channel, event)
-            
-            logger.debug(
-                "Event published",
-                extra={
-                    "event_type": event_type.value,
-                    "data_keys": list(data.keys())
-                }
-            )
-            
-        except Exception as e:
-            logger.error(
-                "Failed to publish event",
-                extra={
-                    "event_type": event_type.value,
-                    "error": str(e)
-                }
-            )
+        event_json = json.dumps(event)
+        
+        # Publish to Redis channel
+        num_subscribers = await self.redis.publish(event_type, event_json)
+        
+        logger.info("Event published", extra={
+            "event_type": event_type,
+            "num_subscribers": num_subscribers
+        })
+        
+        # Also call local subscribers
+        if event_type in self.subscribers:
+            for callback in self.subscribers[event_type]:
+                try:
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(event)
+                    else:
+                        callback(event)
+                except Exception as e:
+                    logger.error("Event callback error", extra={
+                        "event_type": event_type,
+                        "error": str(e)
+                    })
+        
+        return num_subscribers
     
-    async def start(self):
-        """Start event listener"""
-        if self.running:
-            logger.warning("Event bus already running")
-            return
+    def subscribe(self, event_type: str, callback: Callable):
+        """
+        Subscribe to an event type with a callback function.
         
-        self.running = True
+        Args:
+            event_type: Event type to subscribe to
+            callback: Function to call when event is received
+        """
+        if event_type not in self.subscribers:
+            self.subscribers[event_type] = []
         
-        # Connect to Redis
-        await redis_client.connect()
+        self.subscribers[event_type].append(callback)
         
-        # Subscribe to all channels with handlers
-        if self.handlers:
-            await redis_client.subscribe(*self.handlers.keys())
-        
-        # Start listener task
-        self._listener_task = asyncio.create_task(self._listen())
-        
-        logger.info(
-            "Event bus started",
-            extra={
-                "channels": len(self.handlers),
-                "total_handlers": sum(len(h) for h in self.handlers.values())
-            }
-        )
+        logger.info("Event subscription added", extra={
+            "event_type": event_type,
+            "num_subscribers": len(self.subscribers[event_type])
+        })
     
-    async def stop(self):
-        """Stop event listener"""
-        if not self.running:
-            return
+    def unsubscribe(self, event_type: str, callback: Callable):
+        """
+        Unsubscribe a callback from an event type.
         
-        logger.info("Stopping event bus...")
-        
-        self.running = False
-        
-        # Unsubscribe from all channels
-        if self.handlers:
-            await redis_client.unsubscribe(*self.handlers.keys())
-        
-        # Cancel listener task
-        if self._listener_task:
-            self._listener_task.cancel()
+        Args:
+            event_type: Event type to unsubscribe from
+            callback: Callback function to remove
+        """
+        if event_type in self.subscribers:
             try:
-                await self._listener_task
+                self.subscribers[event_type].remove(callback)
+                logger.info("Event subscription removed", extra={
+                    "event_type": event_type
+                })
+            except ValueError:
+                pass
+    
+    async def start_listener(self, *channels: str):
+        """
+        Start listening to Redis pub/sub channels.
+        
+        Args:
+            channels: Channel names to listen to
+        """
+        if self.listener_task and not self.listener_task.done():
+            logger.warning("Event listener already running")
+            return
+        
+        self.pubsub = await self.redis.subscribe(*channels)
+        
+        if not self.pubsub:
+            logger.error("Failed to create pub/sub connection")
+            return
+        
+        self.listener_task = asyncio.create_task(self._listen())
+        
+        logger.info("Event listener started", extra={
+            "channels": channels
+        })
+    
+    async def stop_listener(self):
+        """Stop the event listener"""
+        if self.listener_task:
+            self.listener_task.cancel()
+            try:
+                await self.listener_task
             except asyncio.CancelledError:
                 pass
         
-        logger.info("Event bus stopped")
-    
-    async def _listen(self):
-        """Listen for events and dispatch to handlers"""
-        logger.info("Event listener started")
-        
-        while self.running:
-            try:
-                # Get message from subscribed channels
-                message = await redis_client.get_message(timeout=1.0)
-                
-                if message:
-                    await self._dispatch(message)
-                
-            except asyncio.CancelledError:
-                break
-                
-            except Exception as e:
-                logger.error(
-                    "Event listener error",
-                    extra={"error": str(e)}
-                )
-                await asyncio.sleep(1)
+        if self.pubsub:
+            await self.pubsub.unsubscribe()
+            await self.pubsub.close()
         
         logger.info("Event listener stopped")
     
-    async def _dispatch(self, message: Dict):
-        """
-        Dispatch event to handlers
-        
-        Args:
-            message: Message from Redis
-        """
-        channel = message.get("channel")
-        data = message.get("data", {})
-        
-        handlers = self.handlers.get(channel, [])
-        
-        if not handlers:
-            return
-        
-        event_type = data.get("type")
-        event_data = data.get("data", {})
-        
-        logger.debug(
-            "Dispatching event",
-            extra={
-                "event_type": event_type,
-                "handlers": len(handlers)
-            }
-        )
-        
-        # Call all handlers
-        for handler in handlers:
-            try:
-                if asyncio.iscoroutinefunction(handler):
-                    await handler(event_data)
-                else:
-                    handler(event_data)
-                    
-            except Exception as e:
-                logger.error(
-                    "Event handler error",
-                    extra={
-                        "event_type": event_type,
-                        "handler": handler.__name__,
-                        "error": str(e)
-                    }
+    async def _listen(self):
+        """Internal listener coroutine"""
+        try:
+            while True:
+                message = await self.pubsub.get_message(
+                    ignore_subscribe_messages=True,
+                    timeout=1.0
                 )
+                
+                if message and message["type"] == "message":
+                    try:
+                        event = json.loads(message["data"])
+                        event_type = event.get("event_type")
+                        
+                        # Call local subscribers
+                        if event_type in self.subscribers:
+                            for callback in self.subscribers[event_type]:
+                                try:
+                                    if asyncio.iscoroutinefunction(callback):
+                                        await callback(event)
+                                    else:
+                                        callback(event)
+                                except Exception as e:
+                                    logger.error("Event callback error", extra={
+                                        "event_type": event_type,
+                                        "error": str(e)
+                                    })
+                    except json.JSONDecodeError as e:
+                        logger.error("Failed to parse event", extra={
+                            "error": str(e)
+                        })
+                
+                await asyncio.sleep(0.1)
+                
+        except asyncio.CancelledError:
+            logger.info("Event listener cancelled")
+        except Exception as e:
+            logger.error("Event listener error", extra={
+                "error": str(e)
+            })
 
 
 # Global event bus instance
 event_bus = EventBus()
 
 
-# Convenience functions
-
-async def publish_task_created(task_id: int, agent_type: str, priority: int = 0):
-    """Publish task created event"""
-    await event_bus.publish(
-        EventType.TASK_CREATED,
-        {
-            "task_id": task_id,
-            "agent_type": agent_type,
-            "priority": priority
-        }
-    )
-
-
-async def publish_task_completed(task_id: int, agent_type: str, duration_seconds: float):
-    """Publish task completed event"""
-    await event_bus.publish(
-        EventType.TASK_COMPLETED,
-        {
-            "task_id": task_id,
-            "agent_type": agent_type,
-            "duration_seconds": duration_seconds
-        }
-    )
-
-
-async def publish_task_failed(task_id: int, agent_type: str, error: str):
-    """Publish task failed event"""
-    await event_bus.publish(
-        EventType.TASK_FAILED,
-        {
-            "task_id": task_id,
-            "agent_type": agent_type,
-            "error": error
-        }
-    )
-
-
-async def publish_agent_error(agent_type: str, error: str, task_id: Optional[int] = None):
-    """Publish agent error event"""
-    await event_bus.publish(
-        EventType.AGENT_ERROR,
-        {
-            "agent_type": agent_type,
-            "error": error,
-            "task_id": task_id
-        }
-    )
+# Common event types
+class EventType:
+    """Common event type constants"""
+    
+    # Task events
+    TASK_CREATED = "task.created"
+    TASK_STARTED = "task.started"
+    TASK_COMPLETED = "task.completed"
+    TASK_FAILED = "task.failed"
+    TASK_RETRIED = "task.retried"
+    
+    # Agent events
+    AGENT_STARTED = "agent.started"
+    AGENT_STOPPED = "agent.stopped"
+    AGENT_ERROR = "agent.error"
+    
+    # Ingestion events
+    FILE_UPLOADED = "file.uploaded"
+    QUESTIONS_EXTRACTED = "questions.extracted"
+    TAGS_SUGGESTED = "tags.suggested"
+    
+    # Pattern mining events
+    PATTERN_LEARNED = "pattern.learned"
+    PATTERN_UPDATED = "pattern.updated"
+    
+    # Paper generation events
+    PAPER_GENERATION_STARTED = "paper.generation.started"
+    PAPER_GENERATED = "paper.generated"
+    PAPER_GENERATION_FAILED = "paper.generation.failed"
+    
+    # Evaluation events
+    ATTEMPT_SUBMITTED = "attempt.submitted"
+    EVALUATION_STARTED = "evaluation.started"
+    EVALUATION_COMPLETED = "evaluation.completed"
+    
+    # Performance analysis events
+    WEAKNESS_IDENTIFIED = "weakness.identified"
+    ROADMAP_UPDATED = "roadmap.updated"

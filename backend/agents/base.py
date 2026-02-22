@@ -1,182 +1,175 @@
 """
-Base agent class with common functionality.
+Base agent class for the multi-agent orchestration system.
 
-All specialized agents inherit from BaseAgent and implement:
-- process() method for task execution
-- validate_input() for input validation
-- Agent-specific logic
+All specialized agents inherit from this base class which provides
+common functionality for task processing, error handling, and logging.
 """
 
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
 from datetime import datetime
-from sqlalchemy.ext.asyncio import AsyncSession
+from enum import Enum
 
-from models.agent import AgentTask, AgentTaskStatus, AgentType
-from agents.task_queue import AgentTaskManager
 from utils.logger import logger
 
 
-class BaseAgent(ABC):
-    """Abstract base class for all agents"""
+class AgentStatus(str, Enum):
+    """Agent status enumeration"""
+    IDLE = "idle"
+    PROCESSING = "processing"
+    ERROR = "error"
+    STOPPED = "stopped"
+
+
+class Agent(ABC):
+    """
+    Base class for all agents in the system.
     
-    def __init__(self, agent_type: AgentType):
+    Each agent must implement the process() method which contains
+    the agent-specific logic for handling tasks.
+    """
+    
+    def __init__(self, agent_type: str):
         """
-        Initialize agent
+        Initialize agent.
         
         Args:
-            agent_type: Type of agent
+            agent_type: Unique identifier for this agent type
         """
         self.agent_type = agent_type
-        self.name = agent_type.value
+        self.status = AgentStatus.IDLE
+        self.tasks_processed = 0
+        self.tasks_failed = 0
+        self.last_error: Optional[str] = None
+        self.started_at: Optional[datetime] = None
     
     @abstractmethod
-    async def process(
-        self,
-        db: AsyncSession,
-        task: AgentTask
-    ) -> Dict[str, Any]:
+    async def process(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Process agent task (must be implemented by subclasses)
+        Process a task.
+        
+        This method must be implemented by each specialized agent.
         
         Args:
-            db: Database session
-            task: Agent task to process
+            task_data: Task data including payload and metadata
         
         Returns:
-            Task output data
+            Result dictionary with processing outcome
         
         Raises:
             Exception: If processing fails
         """
         pass
     
-    @abstractmethod
-    async def validate_input(self, input_data: Dict[str, Any]) -> bool:
+    async def execute_task(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Validate task input data (must be implemented by subclasses)
+        Execute task with error handling and logging.
+        
+        This method wraps the process() method with common functionality.
         
         Args:
-            input_data: Task input data
+            task_data: Task data to process
         
         Returns:
-            True if valid
-        
-        Raises:
-            ValueError: If validation fails
+            Result dictionary
         """
-        pass
-    
-    async def execute(
-        self,
-        db: AsyncSession,
-        task: AgentTask
-    ) -> bool:
-        """
-        Execute task with error handling and status updates
+        task_id = task_data.get("task_id", "unknown")
         
-        Args:
-            db: Database session
-            task: Agent task to execute
-        
-        Returns:
-            True if successful
-        """
         try:
-            # Validate input
-            await self.validate_input(task.input_data)
+            self.status = AgentStatus.PROCESSING
             
-            # Update status to in progress
-            await AgentTaskManager.update_task_status(
-                db,
-                task.id,
-                AgentTaskStatus.IN_PROGRESS
-            )
+            logger.info(f"{self.agent_type} processing task", extra={
+                "agent_type": self.agent_type,
+                "task_id": task_id,
+                "status": self.status.value
+            })
             
-            logger.info(
-                f"{self.name} started processing task",
-                extra={
-                    "task_id": task.id,
-                    "agent_type": self.agent_type.value
-                }
-            )
+            # Call agent-specific processing logic
+            result = await self.process(task_data)
             
-            # Process task
-            output_data = await self.process(db, task)
+            self.tasks_processed += 1
+            self.status = AgentStatus.IDLE
             
-            # Update status to completed
-            await AgentTaskManager.update_task_status(
-                db,
-                task.id,
-                AgentTaskStatus.COMPLETED,
-                output_data=output_data
-            )
+            logger.info(f"{self.agent_type} task completed", extra={
+                "agent_type": self.agent_type,
+                "task_id": task_id,
+                "tasks_processed": self.tasks_processed
+            })
             
-            logger.info(
-                f"{self.name} completed task",
-                extra={
-                    "task_id": task.id,
-                    "agent_type": self.agent_type.value
-                }
-            )
-            
-            return True
+            return {
+                "success": True,
+                "result": result,
+                "agent_type": self.agent_type,
+                "processed_at": datetime.utcnow().isoformat()
+            }
             
         except Exception as e:
-            error_message = str(e)
+            self.tasks_failed += 1
+            self.last_error = str(e)
+            self.status = AgentStatus.ERROR
             
-            logger.error(
-                f"{self.name} failed to process task",
-                extra={
-                    "task_id": task.id,
-                    "agent_type": self.agent_type.value,
-                    "error": error_message
-                }
-            )
-            
-            # Update status to failed
-            await AgentTaskManager.update_task_status(
-                db,
-                task.id,
-                AgentTaskStatus.FAILED,
-                error_message=error_message
-            )
-            
-            return False
-    
-    def log_progress(self, task_id: int, message: str, **kwargs):
-        """
-        Log agent progress
-        
-        Args:
-            task_id: Task ID
-            message: Progress message
-            **kwargs: Additional log data
-        """
-        logger.info(
-            f"{self.name}: {message}",
-            extra={
+            logger.error(f"{self.agent_type} task failed", extra={
+                "agent_type": self.agent_type,
                 "task_id": task_id,
-                "agent_type": self.agent_type.value,
-                **kwargs
+                "error": str(e),
+                "tasks_failed": self.tasks_failed
+            })
+            
+            return {
+                "success": False,
+                "error": str(e),
+                "agent_type": self.agent_type,
+                "failed_at": datetime.utcnow().isoformat()
             }
-        )
     
-    def log_error(self, task_id: int, message: str, error: Exception):
-        """
-        Log agent error
-        
-        Args:
-            task_id: Task ID
-            message: Error message
-            error: Exception object
-        """
-        logger.error(
-            f"{self.name}: {message}",
-            extra={
-                "task_id": task_id,
-                "agent_type": self.agent_type.value,
-                "error": str(error),
-                "error_type": type(error).__name__
-            }
+    def get_status(self) -> Dict[str, Any]:
+        """Get agent status and statistics"""
+        return {
+            "agent_type": self.agent_type,
+            "status": self.status.value,
+            "tasks_processed": self.tasks_processed,
+            "tasks_failed": self.tasks_failed,
+            "last_error": self.last_error,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "success_rate": (
+                self.tasks_processed / (self.tasks_processed + self.tasks_failed)
+                if (self.tasks_processed + self.tasks_failed) > 0
+                else 0.0
+            )
+        }
+    
+    def reset_stats(self):
+        """Reset agent statistics"""
+        self.tasks_processed = 0
+        self.tasks_failed = 0
+        self.last_error = None
+        logger.info(f"{self.agent_type} stats reset", extra={
+            "agent_type": self.agent_type
+        })
+    
+    async def start(self):
+        """Start the agent"""
+        self.started_at = datetime.utcnow()
+        self.status = AgentStatus.IDLE
+        logger.info(f"{self.agent_type} started", extra={
+            "agent_type": self.agent_type,
+            "started_at": self.started_at.isoformat()
+        })
+    
+    async def stop(self):
+        """Stop the agent"""
+        self.status = AgentStatus.STOPPED
+        logger.info(f"{self.agent_type} stopped", extra={
+            "agent_type": self.agent_type,
+            "tasks_processed": self.tasks_processed,
+            "tasks_failed": self.tasks_failed
+        })
+    
+    def __repr__(self) -> str:
+        return (
+            f"<{self.__class__.__name__} "
+            f"type={self.agent_type} "
+            f"status={self.status.value} "
+            f"processed={self.tasks_processed} "
+            f"failed={self.tasks_failed}>"
         )

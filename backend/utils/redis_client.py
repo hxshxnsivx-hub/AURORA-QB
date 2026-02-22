@@ -1,355 +1,291 @@
 """
-Redis client for message queue and caching.
+Redis client utility for message queue and caching.
 
-This module provides a Redis connection manager for:
-- Message queue operations
-- Caching
-- Pub/Sub messaging
+This module provides a Redis client wrapper with connection pooling,
+error handling, and common operations for the agent orchestration system.
 """
 
 import redis.asyncio as redis
-from typing import Optional, Any
+from typing import Optional, Any, Dict
 import json
 import os
 from utils.logger import logger
 
 
 class RedisClient:
-    """Async Redis client wrapper"""
+    """Async Redis client with connection pooling"""
     
     def __init__(self):
         self.redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        self._client: Optional[redis.Redis] = None
-        self._pubsub: Optional[redis.client.PubSub] = None
+        self.pool: Optional[redis.ConnectionPool] = None
+        self.client: Optional[redis.Redis] = None
     
     async def connect(self):
-        """Establish Redis connection"""
-        if self._client is None:
-            self._client = await redis.from_url(
+        """Initialize Redis connection pool"""
+        try:
+            self.pool = redis.ConnectionPool.from_url(
                 self.redis_url,
-                encoding="utf-8",
-                decode_responses=True
+                decode_responses=True,
+                max_connections=20
             )
-            logger.info("Redis connection established", extra={"redis_url": self.redis_url})
+            self.client = redis.Redis(connection_pool=self.pool)
+            
+            # Test connection
+            await self.client.ping()
+            logger.info("Redis connection established", extra={
+                "redis_url": self.redis_url.split("@")[-1]  # Hide credentials
+            })
+        except Exception as e:
+            logger.error("Failed to connect to Redis", extra={
+                "error": str(e),
+                "redis_url": self.redis_url.split("@")[-1]
+            })
+            raise
     
     async def disconnect(self):
         """Close Redis connection"""
-        if self._client:
-            await self._client.close()
-            self._client = None
-            logger.info("Redis connection closed")
+        if self.client:
+            await self.client.close()
+        if self.pool:
+            await self.pool.disconnect()
+        logger.info("Redis connection closed")
     
-    async def ping(self) -> bool:
-        """Check Redis connection"""
+    async def get(self, key: str) -> Optional[str]:
+        """Get value by key"""
         try:
-            if self._client:
-                return await self._client.ping()
-            return False
+            return await self.client.get(key)
         except Exception as e:
-            logger.error("Redis ping failed", extra={"error": str(e)})
-            return False
-    
-    # Queue Operations
-    
-    async def enqueue(self, queue_name: str, data: dict) -> int:
-        """
-        Add item to queue (FIFO using list)
-        
-        Args:
-            queue_name: Name of the queue
-            data: Data to enqueue (will be JSON serialized)
-        
-        Returns:
-            Length of queue after enqueue
-        """
-        if not self._client:
-            await self.connect()
-        
-        serialized = json.dumps(data)
-        length = await self._client.rpush(queue_name, serialized)
-        
-        logger.debug(
-            "Item enqueued",
-            extra={
-                "queue": queue_name,
-                "queue_length": length,
-                "data_keys": list(data.keys())
-            }
-        )
-        
-        return length
-    
-    async def dequeue(self, queue_name: str, timeout: int = 0) -> Optional[dict]:
-        """
-        Remove and return item from queue (blocking)
-        
-        Args:
-            queue_name: Name of the queue
-            timeout: Timeout in seconds (0 = block indefinitely)
-        
-        Returns:
-            Dequeued data or None if timeout
-        """
-        if not self._client:
-            await self.connect()
-        
-        result = await self._client.blpop(queue_name, timeout=timeout)
-        
-        if result:
-            _, serialized = result
-            data = json.loads(serialized)
-            
-            logger.debug(
-                "Item dequeued",
-                extra={
-                    "queue": queue_name,
-                    "data_keys": list(data.keys())
-                }
-            )
-            
-            return data
-        
-        return None
-    
-    async def queue_length(self, queue_name: str) -> int:
-        """Get current queue length"""
-        if not self._client:
-            await self.connect()
-        
-        return await self._client.llen(queue_name)
-    
-    async def peek_queue(self, queue_name: str, start: int = 0, end: int = -1) -> list:
-        """
-        View queue items without removing them
-        
-        Args:
-            queue_name: Name of the queue
-            start: Start index
-            end: End index (-1 for all)
-        
-        Returns:
-            List of items in queue
-        """
-        if not self._client:
-            await self.connect()
-        
-        items = await self._client.lrange(queue_name, start, end)
-        return [json.loads(item) for item in items]
-    
-    # Pub/Sub Operations
-    
-    async def publish(self, channel: str, message: dict) -> int:
-        """
-        Publish message to channel
-        
-        Args:
-            channel: Channel name
-            message: Message to publish
-        
-        Returns:
-            Number of subscribers that received the message
-        """
-        if not self._client:
-            await self.connect()
-        
-        serialized = json.dumps(message)
-        count = await self._client.publish(channel, serialized)
-        
-        logger.debug(
-            "Message published",
-            extra={
-                "channel": channel,
-                "subscribers": count,
-                "message_keys": list(message.keys())
-            }
-        )
-        
-        return count
-    
-    async def subscribe(self, *channels: str):
-        """
-        Subscribe to channels
-        
-        Args:
-            channels: Channel names to subscribe to
-        """
-        if not self._client:
-            await self.connect()
-        
-        if not self._pubsub:
-            self._pubsub = self._client.pubsub()
-        
-        await self._pubsub.subscribe(*channels)
-        
-        logger.info(
-            "Subscribed to channels",
-            extra={"channels": list(channels)}
-        )
-    
-    async def unsubscribe(self, *channels: str):
-        """Unsubscribe from channels"""
-        if self._pubsub:
-            await self._pubsub.unsubscribe(*channels)
-            logger.info(
-                "Unsubscribed from channels",
-                extra={"channels": list(channels)}
-            )
-    
-    async def get_message(self, timeout: float = 1.0) -> Optional[dict]:
-        """
-        Get message from subscribed channels
-        
-        Args:
-            timeout: Timeout in seconds
-        
-        Returns:
-            Message dict or None
-        """
-        if not self._pubsub:
+            logger.error("Redis GET failed", extra={
+                "key": key,
+                "error": str(e)
+            })
             return None
-        
-        message = await self._pubsub.get_message(timeout=timeout)
-        
-        if message and message["type"] == "message":
-            data = json.loads(message["data"])
-            
-            logger.debug(
-                "Message received",
-                extra={
-                    "channel": message["channel"],
-                    "data_keys": list(data.keys())
-                }
-            )
-            
-            return {
-                "channel": message["channel"],
-                "data": data
-            }
-        
-        return None
-    
-    # Caching Operations
     
     async def set(
-        self,
-        key: str,
-        value: Any,
-        expire: Optional[int] = None
+        self, 
+        key: str, 
+        value: str, 
+        ex: Optional[int] = None
     ) -> bool:
         """
         Set key-value pair with optional expiration
         
         Args:
-            key: Cache key
-            value: Value to cache (will be JSON serialized)
-            expire: Expiration in seconds
+            key: Redis key
+            value: Value to store
+            ex: Expiration time in seconds
         
         Returns:
-            True if successful
+            True if successful, False otherwise
         """
-        if not self._client:
-            await self.connect()
-        
-        serialized = json.dumps(value)
-        
-        if expire:
-            return await self._client.setex(key, expire, serialized)
-        else:
-            return await self._client.set(key, serialized)
+        try:
+            await self.client.set(key, value, ex=ex)
+            return True
+        except Exception as e:
+            logger.error("Redis SET failed", extra={
+                "key": key,
+                "error": str(e)
+            })
+            return False
     
-    async def get(self, key: str) -> Optional[Any]:
-        """
-        Get value by key
-        
-        Args:
-            key: Cache key
-        
-        Returns:
-            Cached value or None
-        """
-        if not self._client:
-            await self.connect()
-        
-        value = await self._client.get(key)
-        
-        if value:
-            return json.loads(value)
-        
-        return None
-    
-    async def delete(self, *keys: str) -> int:
-        """
-        Delete keys
-        
-        Args:
-            keys: Keys to delete
-        
-        Returns:
-            Number of keys deleted
-        """
-        if not self._client:
-            await self.connect()
-        
-        return await self._client.delete(*keys)
+    async def delete(self, key: str) -> bool:
+        """Delete key"""
+        try:
+            await self.client.delete(key)
+            return True
+        except Exception as e:
+            logger.error("Redis DELETE failed", extra={
+                "key": key,
+                "error": str(e)
+            })
+            return False
     
     async def exists(self, key: str) -> bool:
         """Check if key exists"""
-        if not self._client:
-            await self.connect()
-        
-        return await self._client.exists(key) > 0
+        try:
+            return await self.client.exists(key) > 0
+        except Exception as e:
+            logger.error("Redis EXISTS failed", extra={
+                "key": key,
+                "error": str(e)
+            })
+            return False
     
-    async def expire(self, key: str, seconds: int) -> bool:
-        """Set expiration on key"""
-        if not self._client:
-            await self.connect()
-        
-        return await self._client.expire(key, seconds)
+    # Queue operations
     
-    async def ttl(self, key: str) -> int:
-        """Get time to live for key"""
-        if not self._client:
-            await self.connect()
-        
-        return await self._client.ttl(key)
+    async def lpush(self, key: str, *values: str) -> int:
+        """Push values to the left of list"""
+        try:
+            return await self.client.lpush(key, *values)
+        except Exception as e:
+            logger.error("Redis LPUSH failed", extra={
+                "key": key,
+                "error": str(e)
+            })
+            return 0
     
-    # Hash Operations (for structured data)
+    async def rpush(self, key: str, *values: str) -> int:
+        """Push values to the right of list"""
+        try:
+            return await self.client.rpush(key, *values)
+        except Exception as e:
+            logger.error("Redis RPUSH failed", extra={
+                "key": key,
+                "error": str(e)
+            })
+            return 0
     
-    async def hset(self, name: str, key: str, value: Any) -> int:
+    async def lpop(self, key: str) -> Optional[str]:
+        """Pop value from the left of list"""
+        try:
+            return await self.client.lpop(key)
+        except Exception as e:
+            logger.error("Redis LPOP failed", extra={
+                "key": key,
+                "error": str(e)
+            })
+            return None
+    
+    async def rpop(self, key: str) -> Optional[str]:
+        """Pop value from the right of list"""
+        try:
+            return await self.client.rpop(key)
+        except Exception as e:
+            logger.error("Redis RPOP failed", extra={
+                "key": key,
+                "error": str(e)
+            })
+            return None
+    
+    async def llen(self, key: str) -> int:
+        """Get length of list"""
+        try:
+            return await self.client.llen(key)
+        except Exception as e:
+            logger.error("Redis LLEN failed", extra={
+                "key": key,
+                "error": str(e)
+            })
+            return 0
+    
+    async def lrange(self, key: str, start: int, end: int) -> list:
+        """Get range of values from list"""
+        try:
+            return await self.client.lrange(key, start, end)
+        except Exception as e:
+            logger.error("Redis LRANGE failed", extra={
+                "key": key,
+                "error": str(e)
+            })
+            return []
+    
+    # Pub/Sub operations
+    
+    async def publish(self, channel: str, message: str) -> int:
+        """Publish message to channel"""
+        try:
+            return await self.client.publish(channel, message)
+        except Exception as e:
+            logger.error("Redis PUBLISH failed", extra={
+                "channel": channel,
+                "error": str(e)
+            })
+            return 0
+    
+    async def subscribe(self, *channels: str):
+        """Subscribe to channels"""
+        try:
+            pubsub = self.client.pubsub()
+            await pubsub.subscribe(*channels)
+            return pubsub
+        except Exception as e:
+            logger.error("Redis SUBSCRIBE failed", extra={
+                "channels": channels,
+                "error": str(e)
+            })
+            return None
+    
+    # Hash operations
+    
+    async def hset(self, name: str, key: str, value: str) -> int:
         """Set hash field"""
-        if not self._client:
-            await self.connect()
-        
-        serialized = json.dumps(value)
-        return await self._client.hset(name, key, serialized)
+        try:
+            return await self.client.hset(name, key, value)
+        except Exception as e:
+            logger.error("Redis HSET failed", extra={
+                "name": name,
+                "key": key,
+                "error": str(e)
+            })
+            return 0
     
-    async def hget(self, name: str, key: str) -> Optional[Any]:
+    async def hget(self, name: str, key: str) -> Optional[str]:
         """Get hash field"""
-        if not self._client:
-            await self.connect()
-        
-        value = await self._client.hget(name, key)
-        
-        if value:
-            return json.loads(value)
-        
-        return None
+        try:
+            return await self.client.hget(name, key)
+        except Exception as e:
+            logger.error("Redis HGET failed", extra={
+                "name": name,
+                "key": key,
+                "error": str(e)
+            })
+            return None
     
-    async def hgetall(self, name: str) -> dict:
+    async def hgetall(self, name: str) -> Dict[str, str]:
         """Get all hash fields"""
-        if not self._client:
-            await self.connect()
-        
-        data = await self._client.hgetall(name)
-        
-        return {k: json.loads(v) for k, v in data.items()}
+        try:
+            return await self.client.hgetall(name)
+        except Exception as e:
+            logger.error("Redis HGETALL failed", extra={
+                "name": name,
+                "error": str(e)
+            })
+            return {}
     
     async def hdel(self, name: str, *keys: str) -> int:
         """Delete hash fields"""
-        if not self._client:
-            await self.connect()
-        
-        return await self._client.hdel(name, *keys)
+        try:
+            return await self.client.hdel(name, *keys)
+        except Exception as e:
+            logger.error("Redis HDEL failed", extra={
+                "name": name,
+                "keys": keys,
+                "error": str(e)
+            })
+            return 0
+    
+    # JSON helper methods
+    
+    async def set_json(
+        self, 
+        key: str, 
+        value: Any, 
+        ex: Optional[int] = None
+    ) -> bool:
+        """Set JSON-serialized value"""
+        try:
+            json_str = json.dumps(value)
+            return await self.set(key, json_str, ex=ex)
+        except Exception as e:
+            logger.error("Redis SET_JSON failed", extra={
+                "key": key,
+                "error": str(e)
+            })
+            return False
+    
+    async def get_json(self, key: str) -> Optional[Any]:
+        """Get JSON-deserialized value"""
+        try:
+            value = await self.get(key)
+            if value:
+                return json.loads(value)
+            return None
+        except Exception as e:
+            logger.error("Redis GET_JSON failed", extra={
+                "key": key,
+                "error": str(e)
+            })
+            return None
 
 
 # Global Redis client instance

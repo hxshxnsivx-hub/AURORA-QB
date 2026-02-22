@@ -1,315 +1,343 @@
 """
-Agent monitoring and management API endpoints.
+API endpoints for agent orchestration and monitoring.
 
-Provides endpoints for:
-- Agent status monitoring
-- Queue statistics
-- Task management
-- Dead letter queue handling
+This module provides REST endpoints for:
+- Submitting tasks to agents
+- Monitoring task status
+- Viewing agent statistics
+- Managing failed tasks
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, HTTPException, Depends, status
 from typing import List, Optional
-from datetime import datetime, timedelta
 
-from database import get_db
+from schemas.agent import (
+    TaskCreate,
+    TaskResponse,
+    AgentStatusResponse,
+    OrchestratorStatsResponse,
+    EventPublish,
+    EventResponse,
+    TaskPriority
+)
+from agents.orchestrator import orchestrator
+from agents.events import event_bus
+from agents.task_queue import task_queue
 from api.dependencies import get_current_user, require_role
 from models.user import User, UserRole
-from models.agent import AgentTask, AgentTaskStatus, AgentType
-from agents.orchestrator import orchestrator
-from agents.task_queue import TaskQueue, AgentTaskManager
-from agents.retry import RetryManager, RetryConfig
-from schemas.agent import (
-    AgentTaskResponse,
-    AgentStatsResponse,
-    QueueStatsResponse,
-    RetryTaskRequest
-)
+from utils.logger import logger
 
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
 
 
-@router.get("/stats", response_model=AgentStatsResponse)
-async def get_agent_stats(
-    current_user: User = Depends(require_role(UserRole.FACULTY))
+@router.post(
+    "/tasks",
+    response_model=TaskResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_role(UserRole.FACULTY))]
+)
+async def create_task(
+    task: TaskCreate,
+    current_user: User = Depends(get_current_user)
 ):
     """
-    Get agent orchestrator statistics
+    Create a new task for agent processing.
     
-    Requires: Faculty or Admin role
+    **Required Role**: Faculty or Admin
     
-    Returns:
-    - Orchestrator status
-    - Worker pool status
-    - Registered agents
-    - Queue statistics
+    **Parameters**:
+    - agent_type: Type of agent to process the task
+    - payload: Task-specific data
+    - priority: Task priority (high, normal, low)
+    
+    **Returns**: Created task with ID and status
     """
-    stats = await orchestrator.get_stats()
-    
-    return AgentStatsResponse(**stats)
-
-
-@router.get("/queues", response_model=QueueStatsResponse)
-async def get_queue_stats(
-    current_user: User = Depends(require_role(UserRole.FACULTY))
-):
-    """
-    Get queue statistics
-    
-    Requires: Faculty or Admin role
-    
-    Returns:
-    - Main queue length
-    - Processing queue length
-    - Dead letter queue length
-    """
-    stats = await TaskQueue.get_queue_stats()
-    
-    return QueueStatsResponse(**stats)
-
-
-@router.get("/tasks", response_model=List[AgentTaskResponse])
-async def list_tasks(
-    db: AsyncSession = Depends(get_db),
-    status: Optional[AgentTaskStatus] = Query(None, description="Filter by status"),
-    agent_type: Optional[AgentType] = Query(None, description="Filter by agent type"),
-    limit: int = Query(50, ge=1, le=100, description="Maximum number of tasks"),
-    current_user: User = Depends(require_role(UserRole.FACULTY))
-):
-    """
-    List agent tasks
-    
-    Requires: Faculty or Admin role
-    
-    Query Parameters:
-    - status: Filter by task status
-    - agent_type: Filter by agent type
-    - limit: Maximum number of tasks (1-100)
-    
-    Returns:
-    - List of agent tasks
-    """
-    from sqlalchemy import select
-    
-    query = select(AgentTask)
-    
-    if status:
-        query = query.where(AgentTask.status == status)
-    
-    if agent_type:
-        query = query.where(AgentTask.agent_type == agent_type)
-    
-    query = query.order_by(AgentTask.created_at.desc()).limit(limit)
-    
-    result = await db.execute(query)
-    tasks = result.scalars().all()
-    
-    return [AgentTaskResponse.from_orm(task) for task in tasks]
-
-
-@router.get("/tasks/{task_id}", response_model=AgentTaskResponse)
-async def get_task(
-    task_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.FACULTY))
-):
-    """
-    Get agent task by ID
-    
-    Requires: Faculty or Admin role
-    
-    Returns:
-    - Task details including input/output data
-    """
-    task = await AgentTaskManager.get_task(db, task_id)
-    
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    return AgentTaskResponse.from_orm(task)
-
-
-@router.post("/tasks/{task_id}/retry")
-async def retry_task(
-    task_id: int,
-    request: RetryTaskRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.ADMIN))
-):
-    """
-    Retry a failed task
-    
-    Requires: Admin role
-    
-    Request Body:
-    - max_attempts: Maximum retry attempts (optional)
-    - initial_delay: Initial delay in seconds (optional)
-    
-    Returns:
-    - Success message
-    """
-    # Get task
-    task = await AgentTaskManager.get_task(db, task_id)
-    
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    if task.status != AgentTaskStatus.FAILED:
+    try:
+        task_id = await orchestrator.submit_task(
+            agent_type=task.agent_type,
+            payload=task.payload,
+            priority=task.priority,
+            user_id=current_user.id
+        )
+        
+        # Get task details
+        task_data = await task_queue.get_task(task_id)
+        
+        if not task_data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to retrieve created task"
+            )
+        
+        return task_data
+        
+    except ValueError as e:
         raise HTTPException(
-            status_code=400,
-            detail=f"Task is not in failed state (current: {task.status.value})"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error("Failed to create task", extra={
+            "error": str(e),
+            "user_id": current_user.id
+        })
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create task"
+        )
+
+
+@router.get(
+    "/tasks/{task_id}",
+    response_model=TaskResponse,
+    dependencies=[Depends(get_current_user)]
+)
+async def get_task(task_id: str):
+    """
+    Get task status and details by ID.
+    
+    **Required Role**: Any authenticated user
+    
+    **Parameters**:
+    - task_id: Unique task identifier
+    
+    **Returns**: Task details including status and result
+    """
+    task_data = await task_queue.get_task(task_id)
+    
+    if not task_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task {task_id} not found"
         )
     
-    # Create retry config
-    config = RetryConfig(
-        max_attempts=request.max_attempts or 3,
-        initial_delay=request.initial_delay or 1.0
-    )
+    return task_data
+
+
+@router.get(
+    "/stats",
+    response_model=OrchestratorStatsResponse,
+    dependencies=[Depends(require_role(UserRole.ADMIN))]
+)
+async def get_orchestrator_stats():
+    """
+    Get orchestrator and agent statistics.
     
-    # Schedule retry
-    success = await RetryManager.retry_task(db, task_id, config)
+    **Required Role**: Admin
+    
+    **Returns**: Complete orchestrator statistics including:
+    - Running status
+    - Number of agents and workers
+    - Queue statistics
+    - Per-agent statistics
+    """
+    try:
+        stats = await orchestrator.get_stats()
+        return stats
+    except Exception as e:
+        logger.error("Failed to get orchestrator stats", extra={
+            "error": str(e)
+        })
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve statistics"
+        )
+
+
+@router.get(
+    "/failed-tasks",
+    response_model=List[TaskResponse],
+    dependencies=[Depends(require_role(UserRole.ADMIN))]
+)
+async def get_failed_tasks(limit: int = 100):
+    """
+    Get failed tasks from dead letter queue.
+    
+    **Required Role**: Admin
+    
+    **Parameters**:
+    - limit: Maximum number of tasks to return (default: 100)
+    
+    **Returns**: List of failed tasks with error details
+    """
+    try:
+        failed_tasks = await orchestrator.get_failed_tasks(limit=limit)
+        return failed_tasks
+    except Exception as e:
+        logger.error("Failed to get failed tasks", extra={
+            "error": str(e)
+        })
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve failed tasks"
+        )
+
+
+@router.post(
+    "/tasks/{task_id}/retry",
+    response_model=TaskResponse,
+    dependencies=[Depends(require_role(UserRole.ADMIN))]
+)
+async def retry_task(task_id: str):
+    """
+    Retry a failed task.
+    
+    **Required Role**: Admin
+    
+    **Parameters**:
+    - task_id: Task ID to retry
+    
+    **Returns**: Updated task details
+    """
+    success = await orchestrator.retry_failed_task(task_id)
     
     if not success:
-        raise HTTPException(status_code=500, detail="Failed to schedule retry")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Task cannot be retried (max retries exceeded or not found)"
+        )
     
-    return {
-        "message": "Task retry scheduled",
-        "task_id": task_id,
-        "retry_count": task.retry_count + 1
-    }
+    # Get updated task data
+    task_data = await task_queue.get_task(task_id)
+    
+    if not task_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task {task_id} not found"
+        )
+    
+    return task_data
 
 
-@router.post("/tasks/retry-failed")
-async def retry_failed_tasks(
-    since_hours: int = Query(24, ge=1, le=168, description="Retry tasks failed in last N hours"),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.ADMIN))
-):
+@router.delete(
+    "/tasks/completed",
+    dependencies=[Depends(require_role(UserRole.ADMIN))]
+)
+async def clear_completed_tasks(older_than_days: int = 7):
     """
-    Retry all failed tasks
+    Clear completed tasks older than specified days.
     
-    Requires: Admin role
+    **Required Role**: Admin
     
-    Query Parameters:
-    - since_hours: Retry tasks failed in last N hours (1-168)
+    **Parameters**:
+    - older_than_days: Clear tasks completed more than this many days ago (default: 7)
     
-    Returns:
-    - Number of tasks scheduled for retry
+    **Returns**: Number of tasks cleared
     """
-    since = datetime.utcnow() - timedelta(hours=since_hours)
-    
-    retry_count = await RetryManager.retry_failed_tasks(db, since=since)
-    
-    return {
-        "message": f"Scheduled {retry_count} tasks for retry",
-        "retry_count": retry_count,
-        "since": since.isoformat()
-    }
+    try:
+        count = await orchestrator.clear_old_tasks(older_than_days=older_than_days)
+        return {
+            "message": f"Cleared {count} completed tasks",
+            "count": count,
+            "older_than_days": older_than_days
+        }
+    except Exception as e:
+        logger.error("Failed to clear completed tasks", extra={
+            "error": str(e)
+        })
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to clear completed tasks"
+        )
 
 
-@router.get("/tasks/pending/count")
-async def get_pending_count(
-    db: AsyncSession = Depends(get_db),
-    agent_type: Optional[AgentType] = Query(None, description="Filter by agent type"),
-    current_user: User = Depends(require_role(UserRole.FACULTY))
-):
+@router.post(
+    "/events",
+    response_model=EventResponse,
+    dependencies=[Depends(require_role(UserRole.ADMIN))]
+)
+async def publish_event(event: EventPublish):
     """
-    Get count of pending tasks
+    Publish an event to the event bus.
     
-    Requires: Faculty or Admin role
+    **Required Role**: Admin
     
-    Query Parameters:
-    - agent_type: Filter by agent type (optional)
+    **Parameters**:
+    - event_type: Event type/channel name
+    - data: Event data
+    - metadata: Optional metadata
     
-    Returns:
-    - Count of pending tasks
+    **Returns**: Event details and number of subscribers notified
     """
-    tasks = await AgentTaskManager.get_pending_tasks(db, agent_type=agent_type)
-    
-    return {
-        "count": len(tasks),
-        "agent_type": agent_type.value if agent_type else "all"
-    }
+    try:
+        num_subscribers = await event_bus.publish(
+            event_type=event.event_type,
+            data=event.data,
+            metadata=event.metadata
+        )
+        
+        from datetime import datetime
+        
+        return {
+            "event_type": event.event_type,
+            "data": event.data,
+            "metadata": event.metadata or {},
+            "timestamp": datetime.utcnow(),
+            "num_subscribers": num_subscribers
+        }
+    except Exception as e:
+        logger.error("Failed to publish event", extra={
+            "error": str(e),
+            "event_type": event.event_type
+        })
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to publish event"
+        )
 
 
-@router.get("/tasks/failed/count")
-async def get_failed_count(
-    db: AsyncSession = Depends(get_db),
-    since_hours: int = Query(24, ge=1, le=168, description="Count tasks failed in last N hours"),
-    current_user: User = Depends(require_role(UserRole.FACULTY))
-):
+@router.get(
+    "/health",
+    dependencies=[Depends(get_current_user)]
+)
+async def agent_health_check():
     """
-    Get count of failed tasks
+    Check agent system health.
     
-    Requires: Faculty or Admin role
+    **Required Role**: Any authenticated user
     
-    Query Parameters:
-    - since_hours: Count tasks failed in last N hours (1-168)
-    
-    Returns:
-    - Count of failed tasks
+    **Returns**: Health status of agent system
     """
-    since = datetime.utcnow() - timedelta(hours=since_hours)
-    tasks = await AgentTaskManager.get_failed_tasks(db, since=since)
-    
-    return {
-        "count": len(tasks),
-        "since": since.isoformat(),
-        "since_hours": since_hours
-    }
-
-
-@router.delete("/tasks/{task_id}")
-async def delete_task(
-    task_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.ADMIN))
-):
-    """
-    Delete an agent task
-    
-    Requires: Admin role
-    
-    Returns:
-    - Success message
-    """
-    task = await AgentTaskManager.get_task(db, task_id)
-    
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    await db.delete(task)
-    await db.commit()
-    
-    return {
-        "message": "Task deleted",
-        "task_id": task_id
-    }
-
-
-@router.post("/cleanup")
-async def cleanup_old_tasks(
-    days: int = Query(30, ge=7, le=365, description="Delete completed tasks older than N days"),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.ADMIN))
-):
-    """
-    Clean up old completed tasks
-    
-    Requires: Admin role
-    
-    Query Parameters:
-    - days: Delete completed tasks older than N days (7-365)
-    
-    Returns:
-    - Number of tasks deleted
-    """
-    deleted_count = await AgentTaskManager.cleanup_old_tasks(db, days=days)
-    
-    return {
-        "message": f"Deleted {deleted_count} old tasks",
-        "deleted_count": deleted_count,
-        "days": days
-    }
+    try:
+        stats = await orchestrator.get_stats()
+        
+        # Check if orchestrator is running
+        if not stats["running"]:
+            return {
+                "status": "unhealthy",
+                "message": "Orchestrator is not running",
+                "details": stats
+            }
+        
+        # Check if there are any agents
+        if stats["num_agents"] == 0:
+            return {
+                "status": "degraded",
+                "message": "No agents registered",
+                "details": stats
+            }
+        
+        # Check queue health
+        queue_stats = stats["queue"]
+        if queue_stats["failed"] > 100:
+            return {
+                "status": "degraded",
+                "message": f"High number of failed tasks: {queue_stats['failed']}",
+                "details": stats
+            }
+        
+        return {
+            "status": "healthy",
+            "message": "Agent system is operational",
+            "details": stats
+        }
+        
+    except Exception as e:
+        logger.error("Health check failed", extra={
+            "error": str(e)
+        })
+        return {
+            "status": "unhealthy",
+            "message": f"Health check failed: {str(e)}"
+        }
