@@ -11,6 +11,7 @@ This agent handles:
 from typing import Dict, Any, List, Optional
 from uuid import UUID
 import os
+import tempfile
 
 from agents.base import Agent
 from parsers.pdf_parser import PDFParser
@@ -76,7 +77,13 @@ class IngestionAgent(Agent):
             self.db.commit()
             
             # Download file from storage
-            local_path = await download_file(bank.file_path)
+            file_data = download_file(bank.file_path, bank.file_name)
+            
+            # Save to temporary file
+            import tempfile
+            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(bank.file_name)[1]) as tmp_file:
+                tmp_file.write(file_data)
+                local_path = tmp_file.name
             
             # Parse file based on extension
             file_ext = os.path.splitext(bank.file_name)[1].lower()
