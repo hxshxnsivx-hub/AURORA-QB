@@ -240,3 +240,63 @@ class EmbeddingGenerator:
     async def close(self):
         """Close API client"""
         await self.client.close()
+
+
+# Global embedding generator instance
+_embedding_generator: Optional[EmbeddingGenerator] = None
+
+
+def get_embedding_generator() -> EmbeddingGenerator:
+    """Get or create global embedding generator instance"""
+    global _embedding_generator
+    if _embedding_generator is None:
+        _embedding_generator = EmbeddingGenerator(
+            model=settings.EMBEDDING_MODEL,
+            dimensions=1536
+        )
+    return _embedding_generator
+
+
+async def generate_embedding(text: str) -> List[float]:
+    """
+    Generate embedding for text using global generator instance.
+    
+    Convenience function for simple embedding generation.
+    
+    Args:
+        text: Text to embed
+        
+    Returns:
+        Embedding vector as list of floats
+    """
+    generator = get_embedding_generator()
+    return await generator.generate(text)
+
+
+async def generate_embeddings_batch(texts: List[str]) -> List[List[float]]:
+    """
+    Generate embeddings for multiple texts using global generator instance.
+    
+    Args:
+        texts: List of texts to embed
+        
+    Returns:
+        List of embedding vectors
+    """
+    generator = get_embedding_generator()
+    return await generator.generate_batch(texts)
+
+
+def cosine_similarity(embedding1: List[float], embedding2: List[float]) -> float:
+    """
+    Calculate cosine similarity between two embeddings.
+    
+    Args:
+        embedding1: First embedding vector
+        embedding2: Second embedding vector
+        
+    Returns:
+        Cosine similarity score (0 to 1)
+    """
+    generator = get_embedding_generator()
+    return generator.cosine_similarity(embedding1, embedding2)
