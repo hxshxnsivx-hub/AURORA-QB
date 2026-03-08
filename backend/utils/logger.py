@@ -62,6 +62,21 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 
 
+def get_logger(name: str = None) -> logging.Logger:
+    """
+    Get a logger instance.
+    
+    Args:
+        name: Logger name (typically __name__ from calling module)
+    
+    Returns:
+        Logger instance
+    """
+    if name:
+        return logging.getLogger(f"aurora_assess.{name}")
+    return logger
+
+
 def log_api_request(
     method: str,
     path: str,
