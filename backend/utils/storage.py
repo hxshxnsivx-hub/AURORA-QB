@@ -1,5 +1,6 @@
 import hashlib
 import uuid
+import base64
 from datetime import datetime, timedelta
 from typing import Optional, BinaryIO, Tuple
 from io import BytesIO
@@ -106,7 +107,7 @@ class S3Storage:
                 Body=file_data,
                 ContentType=content_type,
                 Metadata=file_metadata,
-                ContentMD5=hashlib.md5(file_data).digest().hex()
+                ContentMD5=base64.b64encode(hashlib.md5(file_data).digest()).decode('utf-8')
             )
             
             logger.info(
@@ -370,3 +371,34 @@ class S3Storage:
 
 # Global storage instance
 storage = S3Storage()
+
+
+# Convenience functions using global storage instance
+def upload_file(
+    file_data: bytes,
+    file_name: str,
+    content_type: str = "application/octet-stream",
+    metadata: Optional[dict] = None
+) -> Tuple[str, str, int]:
+    """Upload file using global storage instance"""
+    return storage.upload_file(file_data, file_name, content_type, metadata)
+
+
+def download_file(file_id: str, file_name: str) -> bytes:
+    """Download file using global storage instance"""
+    return storage.download_file(file_id, file_name)
+
+
+def delete_file(file_id: str, file_name: str, soft_delete: bool = True) -> bool:
+    """Delete file using global storage instance"""
+    return storage.delete_file(file_id, file_name, soft_delete)
+
+
+def generate_presigned_url(file_id: str, file_name: str, expiration: int = 3600) -> str:
+    """Generate presigned URL using global storage instance"""
+    return storage.generate_presigned_url(file_id, file_name, expiration)
+
+
+def verify_file_integrity(file_id: str, file_name: str, expected_checksum: str) -> bool:
+    """Verify file integrity using global storage instance"""
+    return storage.verify_file_integrity(file_id, file_name, expected_checksum)
