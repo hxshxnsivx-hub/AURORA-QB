@@ -154,9 +154,10 @@ class AgentOrchestrator:
                 
                 # Update task status based on result
                 if result.get("success"):
+                    from models.agent import AgentTaskStatus
                     await task_queue.update_task_status(
                         task_id,
-                        status="completed",
+                        AgentTaskStatus.COMPLETED,
                         result=result.get("result"),
                         completed_at=datetime.utcnow()
                     )
@@ -176,9 +177,10 @@ class AgentOrchestrator:
                     
                     if not should_retry:
                         # Max retries exceeded, mark as failed
+                        from models.agent import AgentTaskStatus
                         await task_queue.update_task_status(
                             task_id,
-                            status="failed",
+                            AgentTaskStatus.FAILED,
                             error_message=result.get("error"),
                             completed_at=datetime.utcnow()
                         )
