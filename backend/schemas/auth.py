@@ -1,6 +1,7 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_serializer
 from typing import Optional
 from datetime import datetime
+from uuid import UUID
 from models.user import UserRole
 
 
@@ -34,11 +35,15 @@ class UserLogin(BaseModel):
 
 class UserResponse(BaseModel):
     """Schema for user response"""
-    id: str
+    id: UUID
     email: str
     role: UserRole
     created_at: datetime
     updated_at: datetime
+    
+    @field_serializer('id')
+    def serialize_id(self, value: UUID) -> str:
+        return str(value)
     
     class Config:
         from_attributes = True
