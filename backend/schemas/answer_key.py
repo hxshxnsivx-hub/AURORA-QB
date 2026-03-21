@@ -1,6 +1,6 @@
 """Pydantic schemas for answer keys and grading rubrics"""
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 from typing import List, Dict, Optional
 from uuid import UUID
 from datetime import datetime
@@ -23,6 +23,10 @@ class AnswerKeyCreate(BaseModel):
     model_answer: str
     rubric: Dict
     resource_citations: List[str] = []
+    
+    @field_serializer('question_id')
+    def serialize_question_id(self, value: UUID) -> str:
+        return str(value)
 
 
 class AnswerKeyUpdate(BaseModel):
@@ -44,6 +48,10 @@ class AnswerKeyResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     
+    @field_serializer('id', 'question_id')
+    def serialize_uuids(self, value: UUID) -> str:
+        return str(value)
+    
     class Config:
         from_attributes = True
 
@@ -51,6 +59,10 @@ class AnswerKeyResponse(BaseModel):
 class AnswerKeyGenerationRequest(BaseModel):
     """Schema for requesting answer key generation"""
     paper_id: UUID
+    
+    @field_serializer('paper_id')
+    def serialize_paper_id(self, value: UUID) -> str:
+        return str(value)
 
 
 class AnswerKeyGenerationResponse(BaseModel):
@@ -66,3 +78,7 @@ class AnswerKeyBulkResponse(BaseModel):
     generated_count: int
     total_questions: int
     answer_keys: List[AnswerKeyResponse]
+    
+    @field_serializer('paper_id')
+    def serialize_paper_id(self, value: UUID) -> str:
+        return str(value)
