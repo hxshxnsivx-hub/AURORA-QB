@@ -1,6 +1,6 @@
 """Pydantic schemas for paper operations"""
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 from typing import Dict, List, Optional
 from uuid import UUID
 from datetime import datetime
@@ -21,6 +21,10 @@ class PaperGenerateRequest(BaseModel):
     constraints: PaperConstraints
     num_sets: int = Field(1, ge=1, le=10, description="Number of paper sets to generate")
     title_prefix: Optional[str] = Field("Exam Paper", description="Title prefix for papers")
+    
+    @field_serializer('subject_id')
+    def serialize_subject_id(self, value: UUID) -> str:
+        return str(value)
 
 
 class QuestionInPaper(BaseModel):
@@ -30,6 +34,10 @@ class QuestionInPaper(BaseModel):
     marks: int
     type: str
     order: int
+    
+    @field_serializer('id')
+    def serialize_id(self, value: UUID) -> str:
+        return str(value)
     
     class Config:
         from_attributes = True
@@ -45,6 +53,10 @@ class PaperResponse(BaseModel):
     generation_date: datetime
     constraints: Dict
     questions_count: Optional[int] = None
+    
+    @field_serializer('id', 'subject_id', 'faculty_id')
+    def serialize_uuids(self, value: UUID) -> str:
+        return str(value)
     
     class Config:
         from_attributes = True
