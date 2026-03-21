@@ -1,6 +1,7 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 from typing import Optional
 from datetime import datetime
+from uuid import UUID
 
 
 class SubjectCreate(BaseModel):
@@ -21,11 +22,15 @@ class SubjectCreate(BaseModel):
 
 class SubjectResponse(BaseModel):
     """Schema for subject response"""
-    id: str
+    id: UUID
     name: str
     code: str
     description: Optional[str]
     created_at: datetime
+    
+    @field_serializer('id')
+    def serialize_id(self, value: UUID) -> str:
+        return str(value)
     
     class Config:
         from_attributes = True
@@ -40,9 +45,13 @@ class SubjectUpdate(BaseModel):
 
 class UnitCreate(BaseModel):
     """Schema for creating a unit"""
-    subject_id: str
+    subject_id: UUID
     name: str = Field(..., min_length=1, max_length=255)
     order: int = Field(..., ge=1)
+    
+    @field_serializer('subject_id')
+    def serialize_subject_id(self, value: UUID) -> str:
+        return str(value)
     
     class Config:
         json_schema_extra = {
@@ -56,11 +65,15 @@ class UnitCreate(BaseModel):
 
 class UnitResponse(BaseModel):
     """Schema for unit response"""
-    id: str
-    subject_id: str
+    id: UUID
+    subject_id: UUID
     name: str
     order: int
     created_at: datetime
+    
+    @field_serializer('id', 'subject_id')
+    def serialize_uuids(self, value: UUID) -> str:
+        return str(value)
     
     class Config:
         from_attributes = True
@@ -74,9 +87,13 @@ class UnitUpdate(BaseModel):
 
 class TopicCreate(BaseModel):
     """Schema for creating a topic"""
-    unit_id: str
+    unit_id: UUID
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
+    
+    @field_serializer('unit_id')
+    def serialize_unit_id(self, value: UUID) -> str:
+        return str(value)
     
     class Config:
         json_schema_extra = {
@@ -90,11 +107,15 @@ class TopicCreate(BaseModel):
 
 class TopicResponse(BaseModel):
     """Schema for topic response"""
-    id: str
-    unit_id: str
+    id: UUID
+    unit_id: UUID
     name: str
     description: Optional[str]
     created_at: datetime
+    
+    @field_serializer('id', 'unit_id')
+    def serialize_uuids(self, value: UUID) -> str:
+        return str(value)
     
     class Config:
         from_attributes = True
@@ -108,10 +129,14 @@ class TopicUpdate(BaseModel):
 
 class ConceptCreate(BaseModel):
     """Schema for creating a concept"""
-    topic_id: str
+    topic_id: UUID
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
     importance: float = Field(default=0.5, ge=0.0, le=1.0)
+    
+    @field_serializer('topic_id')
+    def serialize_topic_id(self, value: UUID) -> str:
+        return str(value)
     
     class Config:
         json_schema_extra = {
@@ -126,12 +151,16 @@ class ConceptCreate(BaseModel):
 
 class ConceptResponse(BaseModel):
     """Schema for concept response"""
-    id: str
-    topic_id: str
+    id: UUID
+    topic_id: UUID
     name: str
     description: Optional[str]
     importance: float
     created_at: datetime
+    
+    @field_serializer('id', 'topic_id')
+    def serialize_uuids(self, value: UUID) -> str:
+        return str(value)
     
     class Config:
         from_attributes = True
